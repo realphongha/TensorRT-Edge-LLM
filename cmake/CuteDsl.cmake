@@ -1043,7 +1043,8 @@ function(cute_dsl_setup)
   foreach(_tgt ${ARG_LINK_TARGETS})
     get_target_property(_tgt_type ${_tgt} TYPE)
     if(_tgt_type STREQUAL "STATIC_LIBRARY")
-      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
+      target_link_libraries(${_tgt} PUBLIC ${_link_libs}
+                                            trt_edgellm_cutedsl_cudart_shim)
     else()
       target_link_libraries(${_tgt} PRIVATE ${_link_libs}
                                             trt_edgellm_cutedsl_cudart_shim)

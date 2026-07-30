@@ -38,6 +38,8 @@ namespace trt_edgellm
 namespace
 {
 
+#if NV_TENSORRT_MAJOR > 10 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 6)
+
 constexpr std::size_t kEngineDeviceTransferChunkSize = 4U * 1024U * 1024U;
 constexpr std::size_t kEngineDeviceTransferBufferCount = 2U;
 
@@ -151,6 +153,7 @@ private:
     cudaEvent_t mEvent{nullptr};
     bool mCopyPending{false};
 };
+
 
 class FileStreamReaderV2 : public nvinfer1::IStreamReaderV2
 {
@@ -303,6 +306,90 @@ private:
     int64_t mOffset{0};
     std::array<PinnedHostBuffer, kEngineDeviceTransferBufferCount> mDeviceTransferBuffers;
 };
+#else
+//! Fallback for TensorRT < 10.6 which lacks IStreamReaderV2.
+//! Reads file sequentially into host memory (no GPU direct-to-device streaming).
+class FileStreamReader : public nvinfer1::IStreamReader
+{
+public:
+    explicit FileStreamReader(std::filesystem::path const& filePath)
+        : mPath(filePath.string())
+    {
+        mFd = open(mPath.c_str(), O_RDONLY);
+        if (mFd < 0)
+        {
+            throw std::runtime_error("Failed to open engine file: " + mPath + ": " + std::strerror(errno));
+        }
+
+        struct stat status;
+        if (fstat(mFd, &status) != 0)
+        {
+            close(mFd);
+            mFd = -1;
+            throw std::runtime_error("Failed to stat engine file: " + mPath + ": " + std::strerror(errno));
+        }
+        if (status.st_size <= 0)
+        {
+            close(mFd);
+            mFd = -1;
+            throw std::runtime_error("Engine file is empty: " + mPath);
+        }
+        mSize = static_cast<int64_t>(status.st_size);
+    }
+
+    FileStreamReader(FileStreamReader const&) = delete;
+    FileStreamReader& operator=(FileStreamReader const&) = delete;
+
+    ~FileStreamReader() override
+    {
+        if (mFd >= 0)
+        {
+            close(mFd);
+        }
+    }
+
+    int64_t read(void* destination, int64_t nbBytes) noexcept override
+    {
+        if (destination == nullptr || nbBytes < 0)
+        {
+            return -1;
+        }
+        if (nbBytes == 0 || mOffset >= mSize)
+        {
+            return 0;
+        }
+
+        int64_t const bytesToRead = std::min(nbBytes, mSize - mOffset);
+        auto* output = static_cast<std::byte*>(destination);
+        int64_t totalRead = 0;
+        while (totalRead < bytesToRead)
+        {
+            ssize_t const chunk = ::read(mFd, output + totalRead, static_cast<size_t>(bytesToRead - totalRead));
+            if (chunk < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                return -1;
+            }
+            if (chunk == 0)
+            {
+                break;
+            }
+            totalRead += chunk;
+        }
+        mOffset += totalRead;
+        return totalRead;
+    }
+
+private:
+    std::string mPath;
+    int mFd{-1};
+    int64_t mSize{0};
+    int64_t mOffset{0};
+};
+#endif
 
 } // namespace
 
@@ -461,7 +548,11 @@ bool engineHasOutputTensor(nvinfer1::ICudaEngine const* engine, char const* tens
 std::unique_ptr<nvinfer1::ICudaEngine> deserializeCudaEngineFromFile(
     nvinfer1::IRuntime& runtime, std::filesystem::path const& enginePath)
 {
+#if NV_TENSORRT_MAJOR > 10 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 6)
     FileStreamReaderV2 streamReader(enginePath);
+#else
+    FileStreamReader streamReader(enginePath);
+#endif
     auto engine = std::unique_ptr<nvinfer1::ICudaEngine>(runtime.deserializeCudaEngine(streamReader));
     if (!engine)
     {
